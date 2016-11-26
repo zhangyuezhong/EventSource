@@ -32,19 +32,23 @@
         CLOSED: 2,
 
         defaultOptions: {
-
+			
+			withCredentials: false,
+			 
             loggingEnabled: false,
 
             loggingPrefix: "eventsource",
 
             interval: 500, // milliseconds
 
-            bufferSizeLimit: 256*1024, // bytes
+            bufferSizeLimit: 1024*1024, // bytes
 
             silentTimeout: 300000, // milliseconds
-
+            
+            retryInterval : 3000,
+            
             getArgs:{
-                'evs_buffer_size_limit': 256*1024
+                'evs_buffer_size_limit': 1024*1024
             },
 
             xhrHeaders:{
@@ -111,13 +115,15 @@
                 this.cache = '';
                 this._xhr = new this.XHR(this);
                 this.resetNoActivityTimer();
+                this._bufferLimitExcceeded = false;
+                this._idleTimeout = false;
 
             }
             catch (e) {
 
                 // in an attempt to silence the errors
-                this.log('There were errors inside the pool try-catch');
-                this.dispatchEvent('error', { type: 'error', data: e.message });
+                this.log('An error occured during polling');
+                this.dispatchEvent('error', { type: 'error', data: e.message ,cause:"ConnectionLost"});
             }
         },
 
@@ -126,9 +132,16 @@
             // schedule poll to be called after interval milliseconds
             var evs = this;
             evs.readyState = evs.CONNECTING;
+            var cause ="ConnectionLost";
+            if(evs._idleTimeout){
+            	cause = "IdleTimeout";
+        	}else if(evs._bufferLimitExcceeded){
+        		cause = "BufferLimitExcceeded";
+        	}
             evs.dispatchEvent('error', {
                 type: 'error',
-                data: "Reconnecting "
+                data: "Reconnecting ",
+                cause: cause
             });
             this._pollTimer = setTimeout(function(){evs.poll()}, interval||0);
         },
@@ -162,8 +175,15 @@
                     clearInterval(this._noActivityTimer);
                 }
                 var evs = this;
+                this._idleTimeout = false;
                 this._noActivityTimer = setTimeout(
-                        function(){ evs.log('Timeout! silentTImeout:'+evs.silentTimeout); evs.pollAgain(); },
+                        function(){
+                        		if(evs._idleTimeout === false){
+	                        		evs._idleTimeout = true;
+		                        	evs.log('Timeout! silentTimeout:'+evs.silentTimeout); 
+		                        	evs.pollAgain(); 
+                        		}
+                        	},
                         this.silentTimeout
                         );
             }
@@ -172,7 +192,7 @@
         close: function () {
 
             this.readyState = this.CLOSED;
-            this.log('Closing connection. readyState: '+this.readyState);
+            this.log('Closing connection. readyState: CLOSED');
             this.cleanup();
         },
 
@@ -185,15 +205,16 @@
                 this.resetNoActivityTimer();
 
                 // move this EventSource to OPEN state...
-                if (this.readyState == this.CONNECTING) {
+                if (this._bufferLimitExcceeded === false && this.readyState == this.CONNECTING) {
                     this.readyState = this.OPEN;
                     this.dispatchEvent('open', { type: 'open' });
                 }
 
                 var buffer = request.getBuffer();
-
-                if (buffer.length > this.bufferSizeLimit) {
+                
+                if (this._bufferLimitExcceeded === false && buffer.length > this.bufferSizeLimit) {
                     this.log('buffer.length > this.bufferSizeLimit');
+                    this._bufferLimitExcceeded = true;
                     this.pollAgain();
                 }
 
@@ -340,6 +361,10 @@
         onopen: null,
 
         readyState: 0,
+        
+        _idleTimeout : false,
+        
+        _bufferLimitExcceeded : false,
 
         // ===================================================================
         // helpers functions
@@ -416,13 +441,10 @@
                         evs._onxhrdata();
                     }
                     else {
-                        request._failed = true;
-                        evs.readyState = evs.CLOSED;
-                        evs.dispatchEvent('error', {
-                            type: 'error',
-                            data: "The server responded with "+request.status
-                        });
-                        evs.close();
+						if(!evs._idleTimeout && !evs._bufferLimitExcceeded)
+						{
+							evs.pollAgain(evs.retryInterval);
+						}
                     }
                 }
             };
@@ -441,7 +463,9 @@
             if (evs.lastEventId) {
                 request.setRequestHeader('Last-Event-Id', evs.lastEventId);
             }
-
+			if (evs.withCredentials){
+                request.withCredentials = true;
+            }
             request.send();
         };
 
@@ -505,30 +529,30 @@
             // set handlers
             request.onprogress = function(){
                 request._ready = true;
+                this._failed = false;
                 evs._onxhrdata();
             };
 
             request.onload = function(){
                 this._loaded = true;
+                this._failed = false;
                 evs._onxhrdata();
             };
 
             request.onerror = function(){
-                this._failed = true;
-                evs.readyState = evs.CLOSED;
-                evs.dispatchEvent('error', {
-                    type: 'error',
-                    data: "XDomainRequest error"
-                });
+            	this._failed = true;
+                if(!evs._idleTimeout && !evs._bufferLimitExcceeded)
+				{
+					evs.pollAgain(evs.retryInterval);
+				}
             };
 
             request.ontimeout = function(){
                 this._failed = true;
-                evs.readyState = evs.CLOSED;
-                evs.dispatchEvent('error', {
-                    type: 'error',
-                    data: "XDomainRequest timed out"
-                });
+                if(!evs._idleTimeout && !evs._bufferLimitExcceeded)
+				{
+					evs.pollAgain(evs.retryInterval);
+				}
             };
 
             // XDomainRequest does not allow setting custom headers
